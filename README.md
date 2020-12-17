@@ -21,3 +21,8 @@
 
 
 
+## 致谢
+
+感谢krrish94, 我们借用和参考了他的工作: https://github.com/krrish94/nerf-pytorch
+
+[]: https://github.com/krrish94/nerf-pytorch
