@@ -1,21 +1,24 @@
 import argparse
 import yaml
-from code_1.cfgnode import CfgNode
+
 import glob
 import os
 import torch
 import numpy as np
-from code_1.model import CodeOneModel
+
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
+from code_1 import models
+from code_1.cfgnode import CfgNode
 from code_1.train_utils import run_one_iter_of_nerf
-from code_1.nerf_helpers import get_ray_bundle, meshgrid_xy, mse2psnr, img2mse
+from code_1.nerf_helpers import get_ray_bundle, meshgrid_xy, mse2psnr, img2mse, get_embedding_function
 from code_1.load_blender import load_blender_data
 from code_1.load_llff import load_llff_data
 import time
 import torchvision
 
 def main():
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", type=str, required=True, help="Path to (.yml) config file."
@@ -36,7 +39,6 @@ def main():
 
     # # (Optional:) enable this to track autograd issues when debugging
     # torch.autograd.set_detect_anomaly(True)
-
 
     # If a pre-cached dataset is available, skip the dataloader.
     USE_CACHED_DATASET = False
@@ -99,17 +101,53 @@ def main():
     else:
         device = "cpu"
 
-    model = CodeOneModel()
-    model.to(device)
+    encode_position_fn = get_embedding_function(
+        num_encoding_functions=cfg.models.coarse.num_encoding_fn_xyz,
+        include_input=cfg.models.coarse.include_input_xyz,
+        log_sampling=cfg.models.coarse.log_sampling_xyz,
+    )
 
+    encode_direction_fn = None
+    if cfg.models.coarse.use_viewdirs:
+        encode_direction_fn = get_embedding_function(
+            num_encoding_functions=cfg.models.coarse.num_encoding_fn_dir,
+            include_input=cfg.models.coarse.include_input_dir,
+            log_sampling=cfg.models.coarse.log_sampling_dir,
+        )
+
+    # Initialize a coarse-resolution model.
+    model_coarse = getattr(models, cfg.models.coarse.type)(
+        num_encoding_fn_xyz=cfg.models.coarse.num_encoding_fn_xyz,
+        num_encoding_fn_dir=cfg.models.coarse.num_encoding_fn_dir,
+        include_input_xyz=cfg.models.coarse.include_input_xyz,
+        include_input_dir=cfg.models.coarse.include_input_dir,
+        use_viewdirs=cfg.models.coarse.use_viewdirs,
+    )
+    model_coarse.to(device)
+    # If a fine-resolution model is specified, initialize it.
+    model_fine = None
+    if hasattr(cfg.models, "fine"):
+        model_fine = getattr(models, cfg.models.fine.type)(
+            num_encoding_fn_xyz=cfg.models.fine.num_encoding_fn_xyz,
+            num_encoding_fn_dir=cfg.models.fine.num_encoding_fn_dir,
+            include_input_xyz=cfg.models.fine.include_input_xyz,
+            include_input_dir=cfg.models.fine.include_input_dir,
+            use_viewdirs=cfg.models.fine.use_viewdirs,
+        )
+        model_fine.to(device)
+
+    # Initialize optimizer.
+    trainable_parameters = list(model_coarse.parameters())
+    if model_fine is not None:
+        trainable_parameters += list(model_fine.parameters())
     optimizer = getattr(torch.optim, cfg.optimizer.type)(
-        model.parameters(), lr=cfg.optimizer.lr)
+        trainable_parameters, lr=cfg.optimizer.lr
+    )
 
     # Setup logging.
     logdir = os.path.join(cfg.experiment.logdir, cfg.experiment.id)
     os.makedirs(logdir, exist_ok=True)
     writer = SummaryWriter(logdir)
-
     # Write out config parameters.
     with open(os.path.join(logdir, "config.yml"), "w") as f:
         f.write(cfg.dump())  # cfg, f, default_flow_style=False)
@@ -120,14 +158,22 @@ def main():
     # Load an existing checkpoint, if a path is specified.
     if os.path.exists(configargs.load_checkpoint):
         checkpoint = torch.load(configargs.load_checkpoint)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
+        if checkpoint["model_fine_state_dict"]:
+            model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_iter = checkpoint["iter"]
 
+    # # TODO: Prepare raybatch tensor if batching random rays
 
     for i in trange(start_iter, cfg.experiment.train_iters):
 
-        model.train()
+        model_coarse.train()
+        if model_fine:
+            model_coarse.train()
+
+        rgb_coarse, rgb_fine = None, None
+        target_ray_values = None
         if USE_CACHED_DATASET:
             datafile = np.random.choice(train_paths)
             cache_dict = torch.load(datafile)
@@ -139,7 +185,7 @@ def main():
             target_ray_values = cache_dict["target"][..., :3].reshape((-1, 3))
             select_inds = np.random.choice(
                 ray_origins.shape[0],
-                size=cfg.nerf.train.num_random_rays,
+                size=(cfg.nerf.train.num_random_rays),
                 replace=False,
             )
             ray_origins, ray_directions = (
@@ -153,11 +199,14 @@ def main():
                 cache_dict["height"],
                 cache_dict["width"],
                 cache_dict["focal_length"],
-                model,
+                model_coarse,
+                model_fine,
                 ray_origins,
                 ray_directions,
                 cfg,
                 mode="train",
+                encode_position_fn=encode_position_fn,
+                encode_direction_fn=encode_direction_fn,
             )
         else:
             img_idx = np.random.choice(i_train)
@@ -170,7 +219,7 @@ def main():
             )
             coords = coords.reshape((-1, 2))
             select_inds = np.random.choice(
-                coords.shape[0], size=cfg.nerf.train.num_random_rays, replace=False
+                coords.shape[0], size=(cfg.nerf.train.num_random_rays), replace=False
             )
             select_inds = coords[select_inds]
             ray_origins = ray_origins[select_inds[:, 0], select_inds[:, 1], :]
@@ -183,11 +232,14 @@ def main():
                 H,
                 W,
                 focal,
-                model,
+                model_coarse,
+                model_fine,
                 ray_origins,
                 ray_directions,
                 cfg,
                 mode="train",
+                encode_position_fn=encode_position_fn,
+                encode_direction_fn=encode_direction_fn,
             )
             target_ray_values = target_s
 
@@ -240,7 +292,9 @@ def main():
             or i == cfg.experiment.train_iters - 1
         ):
             tqdm.write("[VAL] =======> Iter: " + str(i))
-            model.eval()
+            model_coarse.eval()
+            if model_fine:
+                model_coarse.eval()
 
             start = time.time()
             with torch.no_grad():
@@ -253,11 +307,14 @@ def main():
                         cache_dict["height"],
                         cache_dict["width"],
                         cache_dict["focal_length"],
-                        model,
+                        model_coarse,
+                        model_fine,
                         cache_dict["ray_origins"].to(device),
                         cache_dict["ray_directions"].to(device),
                         cfg,
                         mode="validation",
+                        encode_position_fn=encode_position_fn,
+                        encode_direction_fn=encode_direction_fn,
                     )
                     target_ray_values = cache_dict["target"].to(device)
                 else:
@@ -271,11 +328,14 @@ def main():
                         H,
                         W,
                         focal,
-                        model,
+                        model_coarse,
+                        model_fine,
                         ray_origins,
                         ray_directions,
                         cfg,
                         mode="validation",
+                        encode_position_fn=encode_position_fn,
+                        encode_direction_fn=encode_direction_fn,
                     )
                     target_ray_values = img_target
                 coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
@@ -315,7 +375,10 @@ def main():
         if i % cfg.experiment.save_every == 0 or i == cfg.experiment.train_iters - 1:
             checkpoint_dict = {
                 "iter": i,
-                "model_state_dict": model.state_dict(),
+                "model_coarse_state_dict": model_coarse.state_dict(),
+                "model_fine_state_dict": None
+                if not model_fine
+                else model_fine.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": loss,
                 "psnr": psnr,
@@ -328,6 +391,7 @@ def main():
 
     print("Done!")
 
+
 def cast_to_image(tensor):
     # Input tensor is (H, W, 3). Convert to (3, H, W).
     tensor = tensor.permute(2, 0, 1)
@@ -337,5 +401,6 @@ def cast_to_image(tensor):
     img = np.moveaxis(img, [-1], [0])
     return img
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
