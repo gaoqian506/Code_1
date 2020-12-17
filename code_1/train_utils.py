@@ -132,11 +132,11 @@ def run_one_iter_of_nerf(
     width,
     focal_length,
     model_coarse,
+    model_fine,
     ray_origins,
     ray_directions,
     options,
     mode="train",
-    model_fine=None,
     encode_position_fn=None,
     encode_direction_fn=None,
 ):
