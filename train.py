@@ -59,6 +59,7 @@ def main():
                 cfg.dataset.basedir,
                 half_res=cfg.dataset.half_res,
                 testskip=cfg.dataset.testskip,
+                debug=cfg.dataset.debug,
             )
             i_train, i_val, i_test = i_split
             H, W, focal = hwf
@@ -280,11 +281,11 @@ def main():
                 + " PSNR: "
                 + str(psnr)
             )
-        writer.add_scalar("train/loss", loss.item(), i)
-        writer.add_scalar("train/coarse_loss", coarse_loss.item(), i)
-        if rgb_fine is not None:
-            writer.add_scalar("train/fine_loss", fine_loss.item(), i)
-        writer.add_scalar("train/psnr", psnr, i)
+            writer.add_scalar("train/loss", loss.item(), i)
+            writer.add_scalar("train/coarse_loss", coarse_loss.item(), i)
+            if rgb_fine is not None:
+                writer.add_scalar("train/fine_loss", fine_loss.item(), i)
+            writer.add_scalar("train/psnr", psnr, i)
 
         # Validation
         if (
