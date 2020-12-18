@@ -85,12 +85,12 @@ def load_blender_data(basedir, half_res=False, testskip=1, debug=False):
 
     # In debug mode, return extremely tiny images
     if debug:
-        H = H // 32
-        W = W // 32
-        focal = focal / 32.0
+        H = H // 16  # 32
+        W = W // 16  # 32
+        focal = focal / 16  # 32.0
         imgs = [
             torch.from_numpy(
-                cv2.resize(imgs[i], dsize=(25, 25), interpolation=cv2.INTER_AREA)
+                cv2.resize(imgs[i], dsize=(H, W), interpolation=cv2.INTER_AREA)
             )
             for i in range(imgs.shape[0])
         ]
